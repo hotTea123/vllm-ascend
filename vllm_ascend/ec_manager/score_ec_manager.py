@@ -22,6 +22,30 @@ class CacheEntry:
 
 
 @dataclass
+class EmbCacheStats:
+    # Access
+    total_requests: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    cpu_hits: int = 0
+    npu_hits: int = 0
+
+    # Promotion
+    promote_attempts: int = 0
+    promote_success: int = 0
+    promote_fail_no_space: int = 0
+    promote_fail_low_score: int = 0
+
+    # Eviction
+    evict_npu: int = 0
+    evict_cpu: int = 0
+    evict_npu_to_cpu: int = 0
+    cpu_evict_due_to_alloc: int = 0
+    freed_entries: int = 0
+    npu_freed_entries: int = 0
+
+
+@dataclass
 class ScoreEncoderCacheManagerMetadata(EncoderCacheManagerMetadata):
     promoting_mm_hashes: list[str]
     cpu_get_encoder_mm_hashes: list[str]
@@ -97,6 +121,8 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
         self.alpha = 4 * self.hidden_size + 5 * self.attn_heads
         self.beta = self.hidden_size * (8 * self.hidden_size + 6 * self.feedforward + 14)
 
+        self.stats = EmbCacheStats()
+
     def score(self, ent: CacheEntry) -> float:
         return (ent.freq + ent.clock) * ent.cal_cost
 
@@ -107,6 +133,10 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
         del self.npu_cache[ent.mm_hash]
         self.freed.append(ent.mm_hash)
         self.npu_num_free_slots += ent.num_embeds
+        self.stats.evict_npu += 1
+        self.stats.evict_npu_to_cpu += 1
+        self.stats.freed_entries += 1
+        self.stats.npu_freed_entries += 1
 
     def should_promote(self, mm_hash: str) -> bool:
         """
@@ -118,9 +148,11 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
         3. If needed, evict lower-score entries from the NPU cache
         """
         ent = self.cpu_cache[mm_hash]
+        self.stats.promote_attempts += 1
 
         # No reclaimable space on the NPU, promotion is impossible
         if ent.num_embeds > self.npu_num_freeable_slots:
+            self.stats.promote_fail_no_space += 1
             return False
 
         if ent.num_embeds <= self.npu_num_free_slots:
@@ -138,10 +170,12 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
 
         threshold = scored[idx][0]
         if ent_value < threshold:
+            self.stats.promote_fail_low_score += 1
             return False
 
-        free_slots = max(self.cache_size * self.watermark - self.npu_num_free_slots,
-                         ent.num_embeds - self.npu_num_free_slots)
+        free_slots = max(
+            self.cache_size * self.watermark - self.npu_num_free_slots, ent.num_embeds - self.npu_num_free_slots
+        )
 
         i = 0
         while free_slots > 0:
@@ -168,6 +202,8 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
 
         # Not cached at all
         if mm_hash not in self.cached:
+            self.stats.total_requests += 1
+            self.stats.cache_misses += 1
             self.on_request()
             return False
 
@@ -181,10 +217,14 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
 
         if request.request_id not in self.cached[mm_hash]:
             self.cached[mm_hash].add(request.request_id)
+            self.stats.total_requests += 1
+            self.stats.cache_hits += 1
             ent = None
             if mm_hash in self.npu_cache:
                 ent = self.npu_cache[mm_hash]
+                self.stats.npu_hits += 1
             else:
+                self.stats.cpu_hits += 1
                 if self.should_promote(mm_hash):
                     # Promote
                     ent = self.cpu_cache[mm_hash]
@@ -192,6 +232,7 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
                     self.npu_num_free_slots -= ent.num_embeds
                     self.npu_num_freeable_slots -= ent.num_embeds
                     self.promoting.append(mm_hash)
+                    self.stats.promote_success += 1
 
                 else:
                     self.cpu_get_encoder_mm_hashes.append(mm_hash)
@@ -210,16 +251,18 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
             for ent in self.npu_cache.values():
                 ent.clock = max(0, ent.clock - 1)
 
+        self.emb_log_stats()
+
         # TODO(zkx): Enabled only in debug mode.
         if self.req_cnt % 1000 == 0:
             self._check_invariant()
 
     def can_allocate(
-            self,
-            request: Request,
-            input_id: int,
-            encoder_compute_budget: int,
-            num_embeds_to_schedule: int,
+        self,
+        request: Request,
+        input_id: int,
+        encoder_compute_budget: int,
+        num_embeds_to_schedule: int,
     ) -> bool:
         """
         Determine whether CPU cache space can be allocated for the current input.
@@ -250,6 +293,9 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
             del self.cpu_cache[mm_hash]
             self.freed.append(mm_hash)
             self.cpu_num_free_slots += ent.num_embeds
+            self.stats.evict_cpu += 1
+            self.stats.cpu_evict_due_to_alloc += 1
+            self.stats.freed_entries += 1
 
         return True
 
@@ -358,7 +404,7 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
 
         # ---------- CPU ----------
         cpu_sum = sum(ent.num_embeds for ent in self.cpu_cache.values())
-        assert (cpu_sum + self.cpu_num_free_slots == self.cpu_cache_size), (
+        assert cpu_sum + self.cpu_num_free_slots == self.cpu_cache_size, (
             f"cpu_sum + cpu_num_free_slots != cpu_cache_size, "
             f"cpu_sum={cpu_sum}, "
             f"cpu_num_free_slots={self.cpu_num_free_slots}, "
@@ -366,10 +412,7 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
         )
 
         cpu_freeable_sum = sum(ent.num_embeds for ent in self.cpu_freeable.values())
-        assert (
-                self.cpu_num_freeable_slots
-                == self.cpu_num_free_slots + cpu_freeable_sum
-        ), (
+        assert self.cpu_num_freeable_slots == self.cpu_num_free_slots + cpu_freeable_sum, (
             f"CPU invariant broken: "
             f"freeable={self.cpu_num_freeable_slots}, "
             f"free={self.cpu_num_free_slots}, "
@@ -378,23 +421,19 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
 
         for mm_hash in self.cpu_freeable:
             assert not self.cached.get(mm_hash), (
-                f"CPU freeable entry {mm_hash} still referenced: "
-                f"{self.cached.get(mm_hash)}"
+                f"CPU freeable entry {mm_hash} still referenced: {self.cached.get(mm_hash)}"
             )
 
         # ---------- NPU ----------
         npu_sum = sum(ent.num_embeds for ent in self.npu_cache.values())
-        assert (npu_sum + self.npu_num_free_slots == self.cache_size), (
+        assert npu_sum + self.npu_num_free_slots == self.cache_size, (
             f"npu_sum + npu_num_free_slots != cache_size, "
             f"npu_sum={npu_sum}, "
             f"npu_num_free_slots={self.npu_num_free_slots}, "
             f"cache_size={self.cache_size}"
         )
         npu_freeable_sum = sum(ent.num_embeds for ent in self.npu_freeable.values())
-        assert (
-                self.npu_num_freeable_slots
-                == self.npu_num_free_slots + npu_freeable_sum
-        ), (
+        assert self.npu_num_freeable_slots == self.npu_num_free_slots + npu_freeable_sum, (
             f"NPU invariant broken: "
             f"freeable={self.npu_num_freeable_slots}, "
             f"free={self.npu_num_free_slots}, "
@@ -403,9 +442,47 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
 
         for mm_hash in self.npu_freeable:
             assert not self.cached.get(mm_hash), (
-                f"NPU freeable entry {mm_hash} still referenced: "
-                f"{self.cached.get(mm_hash)}"
+                f"NPU freeable entry {mm_hash} still referenced: {self.cached.get(mm_hash)}"
             )
+
+    def emb_log_stats(self) -> None:
+        s = self.stats
+        assert s.total_requests == self.req_cnt, f"total_requests={s.total_requests}, req_cnt={self.req_cnt}"
+
+        hit_rate = s.cache_hits * 100 / max(1, s.total_requests)
+        npu_hit_rate = s.npu_hits * 100 / max(1, s.total_requests)
+        cpu_hit_rate = s.cpu_hits * 100 / max(1, s.total_requests)
+
+        logger.info(
+            "[EmbCacheStats] "
+            "req=%d | hit=%d npu_hit=%d cpu_hit=%d | "
+            "hit_rate=%.3f%% npu_hit_rate=%.3f%% cpu_hit_rate=%.3f%% | "
+            "promote=%d/%d | "
+            "evict(cpu=%d npu2cpu=%d due2alloc=%d freed=%d) | "
+            "entries(cpu=%d freeable=%d | npu=%d freeable=%d) | "
+            "slots(cpu=%d/%d npu=%d/%d)",
+            s.total_requests,
+            s.cache_hits,
+            s.npu_hits,
+            s.cpu_hits,
+            hit_rate,
+            npu_hit_rate,
+            cpu_hit_rate,
+            s.promote_success,
+            s.promote_attempts,
+            s.evict_cpu,
+            s.evict_npu_to_cpu,
+            s.cpu_evict_due_to_alloc,
+            s.freed_entries,
+            len(self.cpu_cache),
+            len(self.cpu_freeable),
+            len(self.npu_cache),
+            len(self.npu_freeable),
+            self.cpu_num_free_slots,
+            self.cpu_num_freeable_slots,
+            self.npu_num_free_slots,
+            self.npu_num_freeable_slots,
+        )
 
     def reset(self) -> None:
         """Reset the encoder cache to its initial state.
@@ -433,3 +510,4 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
         self.npu_freeable.clear()
 
         self.req_cnt = 0
+        self.stats = EmbCacheStats()
